@@ -28,9 +28,6 @@ var (
 	configMux    sync.RWMutex
 	enhancedMode *dns.Resolver
 
-	// experimental features
-	ignoreResolveFail bool
-
 	// Outbound Rule
 	mode = Rule
 
@@ -79,13 +76,6 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]provid
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
-	configMux.Unlock()
-}
-
-// UpdateExperimental handle update experimental config
-func UpdateExperimental(value bool) {
-	configMux.Lock()
-	ignoreResolveFail = value
 	configMux.Unlock()
 }
 
@@ -147,6 +137,9 @@ func preHandleMetadata(metadata *C.Metadata) error {
 			metadata.AddrType = C.AtypDomainName
 			if enhancedMode.FakeIPEnabled() {
 				metadata.DstIP = nil
+			} else if node := resolver.DefaultHosts.Search(host); node != nil {
+				// redir-host should lookup the hosts
+				metadata.DstIP = node.Data.(net.IP)
 			}
 		} else if enhancedMode.IsFakeIP(metadata.DstIP) {
 			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
@@ -315,9 +308,6 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 		if !resolved && shouldResolveIP(rule, metadata) {
 			ip, err := resolver.ResolveIP(metadata.Host)
 			if err != nil {
-				if !ignoreResolveFail {
-					return nil, nil, fmt.Errorf("[DNS] resolve %s error: %s", metadata.Host, err.Error())
-				}
 				log.Debugln("[DNS] resolve %s error: %s", metadata.Host, err.Error())
 			} else {
 				log.Debugln("[DNS] %s --> %s", metadata.Host, ip.String())

@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
+	"sync"
 
 	"github.com/Dreamacro/clash/adapters/provider"
 	"github.com/Dreamacro/clash/component/auth"
 	"github.com/Dreamacro/clash/component/dialer"
-	trie "github.com/Dreamacro/clash/component/domain-trie"
 	"github.com/Dreamacro/clash/component/resolver"
+	"github.com/Dreamacro/clash/component/trie"
 	"github.com/Dreamacro/clash/config"
 	C "github.com/Dreamacro/clash/constant"
 	"github.com/Dreamacro/clash/dns"
@@ -20,30 +20,15 @@ import (
 	"github.com/Dreamacro/clash/tunnel"
 )
 
-// forward compatibility before 1.0
-func readRawConfig(path string) ([]byte, error) {
-	data, err := ioutil.ReadFile(path)
-	if err == nil && len(data) != 0 {
-		return data, nil
-	}
-
-	if filepath.Ext(path) != ".yaml" {
-		return nil, err
-	}
-
-	path = path[:len(path)-5] + ".yml"
-	if _, fallbackErr := os.Stat(path); fallbackErr == nil {
-		return ioutil.ReadFile(path)
-	}
-
-	return data, err
-}
+var (
+	mux sync.Mutex
+)
 
 func readConfig(path string) ([]byte, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil, err
 	}
-	data, err := readRawConfig(path)
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -77,10 +62,11 @@ func ParseWithBytes(buf []byte) (*config.Config, error) {
 
 // ApplyConfig dispatch configure to all parts
 func ApplyConfig(cfg *config.Config, force bool) {
+	mux.Lock()
+	defer mux.Unlock()
+
 	updateUsers(cfg.Users)
-	if force {
-		updateGeneral(cfg.General)
-	}
+	updateGeneral(cfg.General, force)
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules)
 	updateDNS(cfg.DNS)
@@ -96,31 +82,23 @@ func GetGeneral() *config.General {
 	}
 
 	general := &config.General{
-		Port:           ports.Port,
-		SocksPort:      ports.SocksPort,
-		RedirPort:      ports.RedirPort,
-		Authentication: authenticator,
-		AllowLan:       P.AllowLan(),
-		BindAddress:    P.BindAddress(),
-		Mode:           tunnel.Mode(),
-		LogLevel:       log.Level(),
+		Inbound: config.Inbound{
+			Port:           ports.Port,
+			SocksPort:      ports.SocksPort,
+			RedirPort:      ports.RedirPort,
+			MixedPort:      ports.MixedPort,
+			Authentication: authenticator,
+			AllowLan:       P.AllowLan(),
+			BindAddress:    P.BindAddress(),
+		},
+		Mode:     tunnel.Mode(),
+		LogLevel: log.Level(),
 	}
 
 	return general
 }
 
-func updateExperimental(c *config.Config) {
-	cfg := c.Experimental
-
-	tunnel.UpdateExperimental(cfg.IgnoreResolveFail)
-	if cfg.Interface != "" && c.DNS.Enable {
-		dialer.DialHook = dialer.DialerWithInterface(cfg.Interface)
-		dialer.ListenPacketHook = dialer.ListenPacketWithInterface(cfg.Interface)
-	} else {
-		dialer.DialHook = nil
-		dialer.ListenPacketHook = nil
-	}
-}
+func updateExperimental(c *config.Config) {}
 
 func updateDNS(c *config.DNS) {
 	if c.Enable == false {
@@ -153,18 +131,11 @@ func updateDNS(c *config.DNS) {
 	}
 }
 
-func updateHosts(tree *trie.Trie) {
+func updateHosts(tree *trie.DomainTrie) {
 	resolver.DefaultHosts = tree
 }
 
 func updateProxies(proxies map[string]C.Proxy, providers map[string]provider.ProxyProvider) {
-	oldProviders := tunnel.Providers()
-
-	// close providers goroutine
-	for _, provider := range oldProviders {
-		provider.Destroy()
-	}
-
 	tunnel.UpdateProxies(proxies, providers)
 }
 
@@ -172,9 +143,22 @@ func updateRules(rules []C.Rule) {
 	tunnel.UpdateRules(rules)
 }
 
-func updateGeneral(general *config.General) {
+func updateGeneral(general *config.General, force bool) {
 	log.SetLevel(general.LogLevel)
 	tunnel.SetMode(general.Mode)
+	resolver.DisableIPv6 = !general.IPv6
+
+	if general.Interface != "" {
+		dialer.DialHook = dialer.DialerWithInterface(general.Interface)
+		dialer.ListenPacketHook = dialer.ListenPacketWithInterface(general.Interface)
+	} else {
+		dialer.DialHook = nil
+		dialer.ListenPacketHook = nil
+	}
+
+	if !force {
+		return
+	}
 
 	allowLan := general.AllowLan
 	P.SetAllowLan(allowLan)
@@ -192,6 +176,10 @@ func updateGeneral(general *config.General) {
 
 	if err := P.ReCreateRedir(general.RedirPort); err != nil {
 		log.Errorln("Start Redir server error: %s", err.Error())
+	}
+
+	if err := P.ReCreateMixed(general.MixedPort); err != nil {
+		log.Errorln("Start Mixed(http and socks5) server error: %s", err.Error())
 	}
 }
 
