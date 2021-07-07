@@ -127,7 +127,6 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 			Client: &D.Client{
 				Net: s.Net,
 				TLSConfig: &tls.Config{
-					ClientSessionCache: globalSessionCache,
 					// alpn identifier, see https://tools.ietf.org/html/draft-hoffman-dprive-dns-tls-alpn-00#page-6
 					NextProtos: []string{"dns"},
 					ServerName: host,
@@ -152,4 +151,19 @@ func handleMsgWithEmptyAnswer(r *D.Msg) *D.Msg {
 	msg.RecursionAvailable = true
 
 	return msg
+}
+
+func msgToIP(msg *D.Msg) []net.IP {
+	ips := []net.IP{}
+
+	for _, answer := range msg.Answer {
+		switch ans := answer.(type) {
+		case *D.AAAA:
+			ips = append(ips, ans.AAAA)
+		case *D.A:
+			ips = append(ips, ans.A)
+		}
+	}
+
+	return ips
 }

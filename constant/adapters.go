@@ -27,10 +27,9 @@ const (
 	LoadBalance
 )
 
-type ServerAdapter interface {
-	net.Conn
-	Metadata() *Metadata
-}
+const (
+	DefaultTCPTimeout = 5 * time.Second
+)
 
 type Connection interface {
 	Chains() Chain
@@ -50,6 +49,15 @@ func (c Chain) String() string {
 	}
 }
 
+func (c Chain) Last() string {
+	switch len(c) {
+	case 0:
+		return ""
+	default:
+		return c[0]
+	}
+}
+
 type Conn interface {
 	net.Conn
 	Connection
@@ -65,8 +73,21 @@ type PacketConn interface {
 type ProxyAdapter interface {
 	Name() string
 	Type() AdapterType
+
+	// StreamConn wraps a protocol around net.Conn with Metadata.
+	//
+	// Examples:
+	//	conn, _ := net.Dial("tcp", "host:port")
+	//	conn, _ = adapter.StreamConn(conn, metadata)
+	//
+	// It returns a C.Conn with protocol which start with
+	// a new session (if any)
 	StreamConn(c net.Conn, metadata *Metadata) (net.Conn, error)
+
+	// DialContext return a C.Conn with protocol which
+	// contains multiplexing-related reuse logic (if any)
 	DialContext(ctx context.Context, metadata *Metadata) (Conn, error)
+
 	DialUDP(metadata *Metadata) (PacketConn, error)
 	SupportUDP() bool
 	MarshalJSON() ([]byte, error)

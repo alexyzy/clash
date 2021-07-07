@@ -2,7 +2,6 @@ package dns
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -18,10 +17,6 @@ import (
 
 	D "github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
-)
-
-var (
-	globalSessionCache = tls.NewLRUClientSessionCache(64)
 )
 
 type dnsClient interface {
@@ -43,6 +38,7 @@ type Resolver struct {
 	fallbackIPFilters     []fallbackIPFilter
 	group                 singleflight.Group
 	lruCache              *cache.LruCache
+	policy                *trie.DomainTrie
 }
 
 // ResolveIP request with TypeA and TypeAAAA, priority return TypeA
@@ -131,6 +127,9 @@ func (r *Resolver) exchangeWithoutCache(m *D.Msg) (msg *D.Msg, err error) {
 			return r.ipExchange(m)
 		}
 
+		if matched := r.matchPolicy(m); len(matched) != 0 {
+			return r.batchExchange(matched, m)
+		}
 		return r.batchExchange(r.main, m)
 	})
 
@@ -145,7 +144,7 @@ func (r *Resolver) exchangeWithoutCache(m *D.Msg) (msg *D.Msg, err error) {
 }
 
 func (r *Resolver) batchExchange(clients []dnsClient, m *D.Msg) (msg *D.Msg, err error) {
-	fast, ctx := picker.WithTimeout(context.Background(), time.Second*5)
+	fast, ctx := picker.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
 	for _, client := range clients {
 		r := client
 		fast.Go(func() (interface{}, error) {
@@ -172,6 +171,24 @@ func (r *Resolver) batchExchange(clients []dnsClient, m *D.Msg) (msg *D.Msg, err
 	return
 }
 
+func (r *Resolver) matchPolicy(m *D.Msg) []dnsClient {
+	if r.policy == nil {
+		return nil
+	}
+
+	domain := r.msgToDomain(m)
+	if domain == "" {
+		return nil
+	}
+
+	record := r.policy.Search(domain)
+	if record == nil {
+		return nil
+	}
+
+	return record.Data.([]dnsClient)
+}
+
 func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 	if r.fallback == nil || len(r.fallbackDomainFilters) == 0 {
 		return false
@@ -194,6 +211,11 @@ func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 
 func (r *Resolver) ipExchange(m *D.Msg) (msg *D.Msg, err error) {
 
+	if matched := r.matchPolicy(m); len(matched) != 0 {
+		res := <-r.asyncExchange(matched, m)
+		return res.Msg, res.Error
+	}
+
 	onlyFallback := r.shouldOnlyQueryFallback(m)
 
 	if onlyFallback {
@@ -212,7 +234,7 @@ func (r *Resolver) ipExchange(m *D.Msg) (msg *D.Msg, err error) {
 	fallbackMsg := r.asyncExchange(r.fallback, m)
 	res := <-msgCh
 	if res.Error == nil {
-		if ips := r.msgToIP(res.Msg); len(ips) != 0 {
+		if ips := msgToIP(res.Msg); len(ips) != 0 {
 			if !r.shouldIPFallback(ips[0]) {
 				msg = res.Msg // no need to wait for fallback result
 				err = res.Error
@@ -247,7 +269,7 @@ func (r *Resolver) resolveIP(host string, dnsType uint16) (ip net.IP, err error)
 		return nil, err
 	}
 
-	ips := r.msgToIP(msg)
+	ips := msgToIP(msg)
 	ipLength := len(ips)
 	if ipLength == 0 {
 		return nil, resolver.ErrIPNotFound
@@ -255,21 +277,6 @@ func (r *Resolver) resolveIP(host string, dnsType uint16) (ip net.IP, err error)
 
 	ip = ips[rand.Intn(ipLength)]
 	return
-}
-
-func (r *Resolver) msgToIP(msg *D.Msg) []net.IP {
-	ips := []net.IP{}
-
-	for _, answer := range msg.Answer {
-		switch ans := answer.(type) {
-		case *D.AAAA:
-			ips = append(ips, ans.AAAA)
-		case *D.A:
-			ips = append(ips, ans.A)
-		}
-	}
-
-	return ips
 }
 
 func (r *Resolver) msgToDomain(msg *D.Msg) string {
@@ -308,6 +315,7 @@ type Config struct {
 	FallbackFilter FallbackFilter
 	Pool           *fakeip.Pool
 	Hosts          *trie.DomainTrie
+	Policy         map[string]NameServer
 }
 
 func NewResolver(config Config) *Resolver {
@@ -325,6 +333,13 @@ func NewResolver(config Config) *Resolver {
 
 	if len(config.Fallback) != 0 {
 		r.fallback = transform(config.Fallback, defaultResolver)
+	}
+
+	if len(config.Policy) != 0 {
+		r.policy = trie.New()
+		for domain, nameserver := range config.Policy {
+			r.policy.Insert(domain, transform([]NameServer{nameserver}, defaultResolver))
+		}
 	}
 
 	fallbackIPFilters := []fallbackIPFilter{}

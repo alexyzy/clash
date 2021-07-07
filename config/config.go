@@ -8,16 +8,17 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Dreamacro/clash/adapters/outbound"
-	"github.com/Dreamacro/clash/adapters/outboundgroup"
-	"github.com/Dreamacro/clash/adapters/provider"
+	"github.com/Dreamacro/clash/adapter"
+	"github.com/Dreamacro/clash/adapter/outbound"
+	"github.com/Dreamacro/clash/adapter/outboundgroup"
+	"github.com/Dreamacro/clash/adapter/provider"
 	"github.com/Dreamacro/clash/component/auth"
 	"github.com/Dreamacro/clash/component/fakeip"
 	"github.com/Dreamacro/clash/component/trie"
 	C "github.com/Dreamacro/clash/constant"
 	"github.com/Dreamacro/clash/dns"
 	"github.com/Dreamacro/clash/log"
-	R "github.com/Dreamacro/clash/rules"
+	R "github.com/Dreamacro/clash/rule"
 	T "github.com/Dreamacro/clash/tunnel"
 
 	yaml "gopkg.in/yaml.v2"
@@ -30,7 +31,7 @@ type General struct {
 	Mode      T.TunnelMode `json:"mode"`
 	LogLevel  log.LogLevel `json:"log-level"`
 	IPv6      bool         `json:"ipv6"`
-	Interface string       `json:"interface-name"`
+	Interface string       `json:"-"`
 }
 
 // Inbound
@@ -38,6 +39,7 @@ type Inbound struct {
 	Port           int      `json:"port"`
 	SocksPort      int      `json:"socks-port"`
 	RedirPort      int      `json:"redir-port"`
+	TProxyPort     int      `json:"tproxy-port"`
 	MixedPort      int      `json:"mixed-port"`
 	Authentication []string `json:"authentication"`
 	AllowLan       bool     `json:"allow-lan"`
@@ -63,6 +65,7 @@ type DNS struct {
 	DefaultNameserver []dns.NameServer `yaml:"default-nameserver"`
 	FakeIPRange       *fakeip.Pool
 	Hosts             *trie.DomainTrie
+	NameServerPolicy  map[string]dns.NameServer
 }
 
 // FallbackFilter config
@@ -70,6 +73,11 @@ type FallbackFilter struct {
 	GeoIP  bool         `yaml:"geoip"`
 	IPCIDR []*net.IPNet `yaml:"ipcidr"`
 	Domain []string     `yaml:"domain"`
+}
+
+// Profile config
+type Profile struct {
+	StoreSelected bool `yaml:"store-selected"`
 }
 
 // Experimental config
@@ -81,6 +89,7 @@ type Config struct {
 	DNS          *DNS
 	Experimental *Experimental
 	Hosts        *trie.DomainTrie
+	Profile      *Profile
 	Rules        []C.Rule
 	Users        []auth.AuthUser
 	Proxies      map[string]C.Proxy
@@ -99,6 +108,7 @@ type RawDNS struct {
 	FakeIPRange       string            `yaml:"fake-ip-range"`
 	FakeIPFilter      []string          `yaml:"fake-ip-filter"`
 	DefaultNameserver []string          `yaml:"default-nameserver"`
+	NameServerPolicy  map[string]string `yaml:"nameserver-policy"`
 }
 
 type RawFallbackFilter struct {
@@ -111,6 +121,7 @@ type RawConfig struct {
 	Port               int          `yaml:"port"`
 	SocksPort          int          `yaml:"socks-port"`
 	RedirPort          int          `yaml:"redir-port"`
+	TProxyPort         int          `yaml:"tproxy-port"`
 	MixedPort          int          `yaml:"mixed-port"`
 	Authentication     []string     `yaml:"authentication"`
 	AllowLan           bool         `yaml:"allow-lan"`
@@ -127,6 +138,7 @@ type RawConfig struct {
 	Hosts         map[string]string                 `yaml:"hosts"`
 	DNS           RawDNS                            `yaml:"dns"`
 	Experimental  Experimental                      `yaml:"experimental"`
+	Profile       Profile                           `yaml:"profile"`
 	Proxy         []map[string]interface{}          `yaml:"proxies"`
 	ProxyGroup    []map[string]interface{}          `yaml:"proxy-groups"`
 	Rule          []string                          `yaml:"rules"`
@@ -143,7 +155,7 @@ func Parse(buf []byte) (*Config, error) {
 }
 
 func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
-	// config with some default value
+	// config with default value
 	rawCfg := &RawConfig{
 		AllowLan:       false,
 		BindAddress:    "*",
@@ -167,6 +179,9 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 				"8.8.8.8",
 			},
 		},
+		Profile: Profile{
+			StoreSelected: true,
+		},
 	}
 
 	if err := yaml.Unmarshal(buf, &rawCfg); err != nil {
@@ -180,6 +195,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	config := &Config{}
 
 	config.Experimental = &rawCfg.Experimental
+	config.Profile = &rawCfg.Profile
 
 	general, err := parseGeneral(rawCfg)
 	if err != nil {
@@ -234,6 +250,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 			Port:        cfg.Port,
 			SocksPort:   cfg.SocksPort,
 			RedirPort:   cfg.RedirPort,
+			TProxyPort:  cfg.TProxyPort,
 			MixedPort:   cfg.MixedPort,
 			AllowLan:    cfg.AllowLan,
 			BindAddress: cfg.BindAddress,
@@ -258,13 +275,13 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	groupsConfig := cfg.ProxyGroup
 	providersConfig := cfg.ProxyProvider
 
-	proxies["DIRECT"] = outbound.NewProxy(outbound.NewDirect())
-	proxies["REJECT"] = outbound.NewProxy(outbound.NewReject())
+	proxies["DIRECT"] = adapter.NewProxy(outbound.NewDirect())
+	proxies["REJECT"] = adapter.NewProxy(outbound.NewReject())
 	proxyList = append(proxyList, "DIRECT", "REJECT")
 
 	// parse proxy
 	for idx, mapping := range proxiesConfig {
-		proxy, err := outbound.ParseProxy(mapping)
+		proxy, err := adapter.ParseProxy(mapping)
 		if err != nil {
 			return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
 		}
@@ -323,7 +340,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			return nil, nil, fmt.Errorf("proxy group %s: the duplicate name", groupName)
 		}
 
-		proxies[groupName] = outbound.NewProxy(group)
+		proxies[groupName] = adapter.NewProxy(group)
 	}
 
 	// initial compatible provider
@@ -342,12 +359,17 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for _, v := range proxyList {
 		ps = append(ps, proxies[v])
 	}
-	hc := provider.NewHealthCheck(ps, "", 0)
+	hc := provider.NewHealthCheck(ps, "", 0, true)
 	pd, _ := provider.NewCompatibleProvider(provider.ReservedName, ps, hc)
 	providersMap[provider.ReservedName] = pd
 
-	global := outboundgroup.NewSelector("GLOBAL", []provider.ProxyProvider{pd})
-	proxies["GLOBAL"] = outbound.NewProxy(global)
+	global := outboundgroup.NewSelector(
+		&outboundgroup.GroupCommonOption{
+			Name: "GLOBAL",
+		},
+		[]provider.ProxyProvider{pd},
+	)
+	proxies["GLOBAL"] = adapter.NewProxy(global)
 	return proxies, providersMap, nil
 }
 
@@ -387,10 +409,6 @@ func parseRules(cfg *RawConfig, proxies map[string]C.Proxy) ([]C.Rule, error) {
 
 		parsed, parseErr := R.ParseRule(rule[0], payload, target, params)
 		if parseErr != nil {
-			if parseErr == R.ErrPlatformNotSupport {
-				log.Warnln("Rules[%d] [%s] don't support current OS, skip", idx, line)
-				continue
-			}
 			return nil, fmt.Errorf("rules[%d] [%s] error: %s", idx, line, parseErr.Error())
 		}
 
@@ -485,6 +503,23 @@ func parseNameServer(servers []string) ([]dns.NameServer, error) {
 	return nameservers, nil
 }
 
+func parseNameServerPolicy(nsPolicy map[string]string) (map[string]dns.NameServer, error) {
+	policy := map[string]dns.NameServer{}
+
+	for domain, server := range nsPolicy {
+		nameservers, err := parseNameServer([]string{server})
+		if err != nil {
+			return nil, err
+		}
+		if _, valid := trie.ValidAndSplitDomain(domain); !valid {
+			return nil, fmt.Errorf("DNS ResoverRule invalid domain: %s", domain)
+		}
+		policy[domain] = nameservers[0]
+	}
+
+	return policy, nil
+}
+
 func parseFallbackIPCIDR(ips []string) ([]*net.IPNet, error) {
 	ipNets := []*net.IPNet{}
 
@@ -519,6 +554,10 @@ func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 	}
 
 	if dnsCfg.Fallback, err = parseNameServer(cfg.Fallback); err != nil {
+		return nil, err
+	}
+
+	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy); err != nil {
 		return nil, err
 	}
 
